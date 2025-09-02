@@ -1,0 +1,175 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-*.yml'
+
+env:
+  TF_VERSION: '1.5.7'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        role-session-name: terraform-plan-${{ matrix.environment }}
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Create terraform.tfvars for ${{ matrix.environment }}
+      run: |
+        cd environments/${{ matrix.environment }}
+        
+        # Create basic terraform.tfvars if it doesn't exist
+        if [ ! -f terraform.tfvars ]; then
+          echo "Creating basic terraform.tfvars for ${{ matrix.environment }}"
+          cat > terraform.tfvars << EOF
+        # Auto-generated for GitHub Actions
+        aws_region = "${{ env.AWS_REGION }}"
+        owner = "GitHub-Actions"
+        
+        # Security - Restrict admin access (update for production)
+        admin_cidr_blocks = ["10.0.0.0/8"]
+        
+        # Monitoring
+        alert_email = "devops@example.com"
+        
+        # Environment-specific settings
+        environment = "${{ matrix.environment }}"
+        EOF
+          
+          # Add environment-specific overrides
+          case "${{ matrix.environment }}" in
+            dev)
+              echo 'instance_type = "t3.small"' >> terraform.tfvars
+              echo 'backup_retention_days = 7' >> terraform.tfvars
+              ;;
+            staging)
+              echo 'instance_type = "t3.medium"' >> terraform.tfvars
+              echo 'backup_retention_days = 14' >> terraform.tfvars
+              ;;
+            prod)
+              echo 'instance_type = "t3.large"' >> terraform.tfvars
+              echo 'backup_retention_days = 90' >> terraform.tfvars
+              echo 'enable_high_availability = true' >> terraform.tfvars
+              ;;
+          esac
+        fi
+    
+    - name: Terraform Format Check
+      id: fmt
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+    
+    - name: Terraform Init
+      id: init
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform init
+    
+    - name: Terraform Validate
+      id: validate
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform validate -no-color
+    
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform plan -no-color -input=false -out=tfplan
+      continue-on-error: true
+    
+    - name: Save Plan Output
+      if: steps.plan.outcome == 'success'
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform show -no-color tfplan > plan-output.txt
+    
+    - name: Comment PR
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN_OUTPUT: "${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read plan output
+          const planPath = path.join('environments', '${{ matrix.environment }}', 'plan-output.txt');
+          let planOutput = '';
+          try {
+            if (fs.existsSync(planPath)) {
+              planOutput = fs.readFileSync(planPath, 'utf8');
+            } else {
+              planOutput = process.env.PLAN_OUTPUT || 'Plan output not available';
+            }
+          } catch (error) {
+            planOutput = 'Error reading plan output: ' + error.message;
+          }
+          
+          // Truncate if too long
+          if (planOutput.length > 60000) {
+            planOutput = planOutput.substring(0, 60000) + '\n\n... (output truncated)';
+          }
+          
+          const output = `## Terraform Plan Results - ${{ matrix.environment }}
+          
+          #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          
+          <details><summary>Show Plan Output for ${{ matrix.environment }}</summary>
+          
+          \`\`\`\n${planOutput}\n\`\`\`
+          
+          </details>
+          
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Environment: \`${{ matrix.environment }}\`*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+    
+    - name: Upload Plan Artifact
+      if: steps.plan.outcome == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ matrix.environment }}
+        path: environments/${{ matrix.environment }}/tfplan
+        retention-days: 5
+    
+    - name: Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: exit 1

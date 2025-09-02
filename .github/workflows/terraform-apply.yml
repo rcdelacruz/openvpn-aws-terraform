@@ -1,0 +1,305 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      auto_approve:
+        description: 'Auto approve the apply'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TF_VERSION: '1.5.7'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  determine-environments:
+    name: Determine Environments to Deploy
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set-environments.outputs.environments }}
+      auto_approve: ${{ steps.set-environments.outputs.auto_approve }}
+    steps:
+    - name: Set environments
+      id: set-environments
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "environments=[\"${{ github.event.inputs.environment }}\"]" >> $GITHUB_OUTPUT
+          echo "auto_approve=${{ github.event.inputs.auto_approve }}" >> $GITHUB_OUTPUT
+        else
+          # For push events, deploy to dev by default
+          echo "environments=[\"dev\"]" >> $GITHUB_OUTPUT
+          echo "auto_approve=true" >> $GITHUB_OUTPUT
+        fi
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: determine-environments
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.determine-environments.outputs.environments) }}
+    
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    
+    environment:
+      name: ${{ matrix.environment }}
+      url: ${{ steps.output.outputs.admin_url }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        role-session-name: terraform-apply-${{ matrix.environment }}
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+    
+    - name: Create terraform.tfvars for ${{ matrix.environment }}
+      run: |
+        cd environments/${{ matrix.environment }}
+        
+        # Create terraform.tfvars if it doesn't exist
+        if [ ! -f terraform.tfvars ]; then
+          echo "Creating terraform.tfvars for ${{ matrix.environment }}"
+          cat > terraform.tfvars << EOF
+        # Auto-generated for GitHub Actions
+        aws_region = "${{ env.AWS_REGION }}"
+        owner = "GitHub-Actions"
+        
+        # Security - IMPORTANT: Update these for production!
+        admin_cidr_blocks = ["10.0.0.0/8"]
+        
+        # Monitoring
+        alert_email = "${{ secrets.ALERT_EMAIL || 'devops@example.com' }}"
+        
+        # Common tags
+        common_tags = {
+          Project = "OpenVPN-CI-CD"
+          Environment = "${{ matrix.environment }}"
+          ManagedBy = "GitHub-Actions"
+          Repository = "${{ github.repository }}"
+        }
+        EOF
+          
+          # Add environment-specific settings
+          case "${{ matrix.environment }}" in
+            dev)
+              cat >> terraform.tfvars << EOF
+        instance_type = "t3.small"
+        backup_retention_days = 7
+        enable_high_availability = false
+        enable_ssl_cert = false
+        create_dns_record = false
+        EOF
+              ;;
+            staging)
+              cat >> terraform.tfvars << EOF
+        instance_type = "t3.medium"
+        backup_retention_days = 14
+        enable_high_availability = false
+        enable_ssl_cert = ${{ secrets.ENABLE_SSL_CERT == 'true' }}
+        domain_name = "${{ secrets.STAGING_DOMAIN_NAME }}"
+        certificate_email = "${{ secrets.CERTIFICATE_EMAIL }}"
+        create_dns_record = ${{ secrets.HOSTED_ZONE_ID != '' }}
+        hosted_zone_id = "${{ secrets.HOSTED_ZONE_ID }}"
+        EOF
+              ;;
+            prod)
+              cat >> terraform.tfvars << EOF
+        instance_type = "t3.large"
+        backup_retention_days = 90
+        enable_high_availability = true
+        min_size = 1
+        max_size = 3
+        desired_capacity = 2
+        enable_ssl_cert = true
+        domain_name = "${{ secrets.PROD_DOMAIN_NAME }}"
+        certificate_email = "${{ secrets.CERTIFICATE_EMAIL }}"
+        create_dns_record = true
+        hosted_zone_id = "${{ secrets.PROD_HOSTED_ZONE_ID }}"
+        
+        # Production security
+        admin_cidr_blocks = ["${{ secrets.PROD_ADMIN_CIDR || '10.0.0.0/8' }}"]
+        cpu_alarm_threshold = 70
+        memory_alarm_threshold = 70
+        disk_alarm_threshold = 70
+        EOF
+              ;;
+          esac
+        fi
+    
+    - name: Terraform Init
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform init
+    
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform plan -input=false -out=tfplan
+    
+    - name: Terraform Apply
+      id: apply
+      run: |
+        cd environments/${{ matrix.environment }}
+        if [ "${{ needs.determine-environments.outputs.auto_approve }}" == "true" ]; then
+          terraform apply -auto-approve tfplan
+        else
+          terraform apply tfplan
+        fi
+    
+    - name: Get Terraform Outputs
+      id: output
+      run: |
+        cd environments/${{ matrix.environment }}
+        
+        # Get outputs and set as GitHub outputs
+        admin_url=$(terraform output -raw ${{ matrix.environment }}_admin_url 2>/dev/null || echo "")
+        client_url=$(terraform output -raw ${{ matrix.environment }}_client_url 2>/dev/null || echo "")
+        
+        echo "admin_url=$admin_url" >> $GITHUB_OUTPUT
+        echo "client_url=$client_url" >> $GITHUB_OUTPUT
+        
+        # Store all outputs in a file for the summary
+        terraform output -json > outputs.json
+    
+    - name: Create Deployment Summary
+      run: |
+        cd environments/${{ matrix.environment }}
+        
+        echo "# 🚀 OpenVPN Deployment Summary - ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 📊 Deployment Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Add URLs if available
+        if [ -n "${{ steps.output.outputs.admin_url }}" ]; then
+          echo "## 🔗 Access URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Admin Interface**: ${{ steps.output.outputs.admin_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Client Interface**: ${{ steps.output.outputs.client_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "## 📋 Post-Deployment Tasks" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        case "${{ matrix.environment }}" in
+          dev)
+            echo "- [ ] Test basic connectivity" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Verify user creation/deletion" >> $GITHUB_STEP_SUMMARY
+            ;;
+          staging)
+            echo "- [ ] Test SSL certificate functionality" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Verify monitoring and alerts" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Test backup and restore procedures" >> $GITHUB_STEP_SUMMARY
+            ;;
+          prod)
+            echo "- [ ] ⚠️ Verify security group restrictions" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] ⚠️ Test high availability failover" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] ⚠️ Confirm monitoring and alerting" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] ⚠️ Verify backup schedule is active" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] ⚠️ Update team documentation" >> $GITHUB_STEP_SUMMARY
+            ;;
+        esac
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 🔧 Management Commands" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# Get admin password" >> $GITHUB_STEP_SUMMARY
+        echo "aws ssm get-parameter --name '/openvpn-${{ matrix.environment }}/openvpn/admin_password' --with-decryption --query 'Parameter.Value' --output text" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# List users (requires SSH key from SSM)" >> $GITHUB_STEP_SUMMARY
+        echo "./scripts/user-management.sh --environment ${{ matrix.environment }} --action list" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Create Issue on Failure
+      if: failure()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 OpenVPN Deployment Failed - ${{ matrix.environment }}`,
+            body: `## Deployment Failure
+            
+            **Environment**: ${{ matrix.environment }}
+            **Workflow**: ${{ github.workflow }}
+            **Run ID**: ${{ github.run_id }}
+            **Commit**: ${{ github.sha }}
+            **Actor**: @${{ github.actor }}
+            
+            The OpenVPN deployment to ${{ matrix.environment }} has failed. Please check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+            
+            ### Next Steps
+            1. Review the workflow logs
+            2. Check AWS resources for any partial deployments
+            3. Consider manual cleanup if necessary
+            4. Fix the issue and re-run the deployment
+            
+            This issue was automatically created by the CI/CD pipeline.`,
+            labels: ['deployment-failure', 'infrastructure', '${{ matrix.environment }}'],
+            assignees: ['${{ github.actor }}']
+          })
+    
+    - name: Store Outputs as Artifacts
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-outputs-${{ matrix.environment }}
+        path: environments/${{ matrix.environment }}/outputs.json
+        retention-days: 30
+
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [determine-environments, apply]
+    if: always() && (success() || failure())
+    steps:
+    - name: Send Slack Notification
+      if: vars.SLACK_WEBHOOK_URL != ''
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#infrastructure'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        custom_payload: |
+          {
+            attachments: [{
+              color: '${{ job.status }}' === 'success' ? 'good' : 'danger',
+              text: `OpenVPN deployment ${{ job.status }} for environments: ${{ needs.determine-environments.outputs.environments }}`
+            }]
+          }

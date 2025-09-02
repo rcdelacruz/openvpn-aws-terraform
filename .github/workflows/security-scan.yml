@@ -1,0 +1,187 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  schedule:
+    # Run security scan daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  terraform-security:
+    name: Terraform Security Scan
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: '1.5.7'
+    
+    - name: Run Checkov
+      id: checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: .
+        quiet: true
+        soft_fail: true
+        framework: terraform
+        output_format: sarif
+        output_file_path: reports/checkov.sarif
+        download_external_modules: false
+    
+    - name: Upload Checkov SARIF
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/checkov.sarif
+        category: checkov
+    
+    - name: Run TFSec
+      uses: aquasecurity/tfsec-sarif-action@v0.1.4
+      with:
+        sarif_file: reports/tfsec.sarif
+    
+    - name: Upload TFSec SARIF
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/tfsec.sarif
+        category: tfsec
+    
+    - name: Run Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'config'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'reports/trivy.sarif'
+    
+    - name: Upload Trivy SARIF
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/trivy.sarif
+        category: trivy
+    
+    - name: Comment PR with Security Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          
+          let securitySummary = '## 🔒 Security Scan Results\n\n';
+          
+          // Check if security scan files exist and add status
+          const scanResults = {
+            'Checkov': 'reports/checkov.sarif',
+            'TFSec': 'reports/tfsec.sarif',
+            'Trivy': 'reports/trivy.sarif'
+          };
+          
+          for (const [tool, file] of Object.entries(scanResults)) {
+            try {
+              if (fs.existsSync(file)) {
+                const content = JSON.parse(fs.readFileSync(file, 'utf8'));
+                const results = content.runs?.[0]?.results || [];
+                const issueCount = results.length;
+                
+                if (issueCount === 0) {
+                  securitySummary += `✅ **${tool}**: No issues found\n`;
+                } else {
+                  const highSeverity = results.filter(r => 
+                    r.level === 'error' || 
+                    r.properties?.severity === 'HIGH' ||
+                    r.properties?.severity === 'CRITICAL'
+                  ).length;
+                  
+                  securitySummary += `⚠️ **${tool}**: ${issueCount} issues found`;
+                  if (highSeverity > 0) {
+                    securitySummary += ` (${highSeverity} high/critical)`;
+                  }
+                  securitySummary += '\n';
+                }
+              } else {
+                securitySummary += `❌ **${tool}**: Scan failed or no results\n`;
+              }
+            } catch (error) {
+              securitySummary += `❌ **${tool}**: Error processing results\n`;
+            }
+          }
+          
+          securitySummary += '\n📊 Detailed results are available in the Security tab of this repository.';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: securitySummary
+          });
+    
+    - name: Upload Security Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-reports
+        path: reports/
+        retention-days: 30
+
+  secrets-scan:
+    name: Secrets Scan
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Run GitLeaks
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  dependency-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Run Snyk to check for vulnerabilities
+      if: vars.SNYK_TOKEN != ''
+      uses: snyk/actions/terraform@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=medium --sarif-file-output=reports/snyk.sarif
+    
+    - name: Upload Snyk SARIF
+      if: vars.SNYK_TOKEN != '' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: reports/snyk.sarif
+        category: snyk
